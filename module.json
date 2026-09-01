@@ -40,7 +40,7 @@
     "esmodules": [
         "scripts/main.js"
     ],
-    "url": "https://github.com/faustolazala/bardic-inspiration-tracker",
-    "manifest": "https://github.com/faustolazala/bardic-inspiration-tracker/releases/latest/download/module.json",
-    "download": "https://github.com/faustolazala/bardic-inspiration-tracker/releases/latest/download/bardic-inspiration-tracker.zip"
+    "url": "https://github.com/gzb1015/Bardic-Inspiration-Tracker-fixed-for-5.3.3-",
+    "manifest": "https://github.com/gzb1015/Bardic-Inspiration-Tracker-fixed-for-5.3.3-/releases/latest/download/module.json",
+    "download": "https://github.com/gzb1015/Bardic-Inspiration-Tracker-fixed-for-5.3.3-/releases/latest/download/bardic-inspiration-tracker.zip"
 }
