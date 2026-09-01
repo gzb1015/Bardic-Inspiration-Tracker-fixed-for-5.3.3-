@@ -2,7 +2,7 @@
     "id": "bardic-inspiration-tracker",
     "title": "Bardic Inspiration Tracker",
     "description": "Tracks Bardic Inspiration",
-    "version": "2.1.5",
+    "version": "2.1.6",
     "socket": true,
     "authors": [
         {
