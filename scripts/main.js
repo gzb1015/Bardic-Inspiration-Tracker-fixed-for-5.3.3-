@@ -1,1304 +1,655 @@
 const MODULE_ID = "bardic-inspiration-tracker";
-let socket;
 
-// ============================================================
-// HOOKS
-// ============================================================
+// ------------------------------------------------------------
+// SETTINGS
+// ------------------------------------------------------------
 
 Hooks.once("init", () => {
     game.settings.register(MODULE_ID, "partyMethod", {
         name: "Party Detection Method",
-        hint: "How to determine which characters belong to the same party.",
+        hint: "Determines how party members are detected.",
         scope: "world",
         config: true,
         type: String,
         choices: {
             folder: "Same Folder",
-            scene: "Active Scene Tokens",
+            scene: "Active Scene Tokens"
         },
-        default: "folder",
+        default: "folder"
     });
-
-    console.log(`${MODULE_ID} | Initialized`);
 });
-
-Hooks.once("socketlib.ready", () => {
-    console.log(`${MODULE_ID} | Registering socket listener`);
-
-    socket = socketlib.registerModule(MODULE_ID);
-    socket.register("giveInspiration", handleGiveInspiration);
-
-    console.log(`${MODULE_ID} | Socket registered via socketlib`);
-});
-
-
-// ============================================================
-// BARDIC INSPIRATION PRE-ROLL HOOKS
-// ============================================================
-
-// Skill checks
-Hooks.on("dnd5e.preRollSkill", (config, dialog, message) => {
-    return handleBardicPreRoll(config, dialog, message);
-});
-
-// Ability checks
-Hooks.on("dnd5e.preRollAbilityCheck", (config, dialog, message) => {
-    return handleBardicPreRoll(config, dialog, message);
-});
-
-// Saving throws
-Hooks.on("dnd5e.preRollSavingThrow", (config, dialog, message) => {
-    return handleBardicPreRoll(config, dialog, message);
-});
-
-
-// ============================================================
-// ACTOR SHEET
-// ============================================================
-
-Hooks.on("renderActorSheetV2", (app, html) => {
-    const actor = app.actor ?? app.document;
-
-    if (!actor || actor.type !== "character") return;
-
-    const root = html instanceof jQuery ? html[0] : html;
-
-    if (!root) return;
-
-    const sheetBody = root.querySelector(".window-content") ?? root;
-
-
-    // --------------------------------------------------------
-    // TRACK BAR
-    // --------------------------------------------------------
-
-    const trackBar = buildTrackBar(actor);
-
-    const sheetHeader =
-        sheetBody.querySelector(".sheet-header") ??
-        sheetBody;
-
-    const sheetLeftDiv =
-        sheetHeader.querySelector(".left") ??
-        sheetHeader;
-
-    sheetLeftDiv.prepend(trackBar);
-
-
-    // --------------------------------------------------------
-    // PARTY PANEL
-    // --------------------------------------------------------
-
-    const isBard = actor.items.some(
-        i =>
-            i.type === "class" &&
-            i.name.toLowerCase() === "bard"
-    );
-
-    if (isBard) {
-        const partyPanel = buildPartyPanel(actor);
-
-        const rightDetailsTab =
-            sheetBody.querySelector(
-                'section.tab[data-tab="details"][data-group="primary"] > .right'
-            ) ??
-            sheetBody;
-
-        rightDetailsTab.append(partyPanel);
-    }
-});
-
-
-// ============================================================
-// ACTOR UPDATE HOOKS
-// ============================================================
-
-Hooks.on("createActor", actor => {
-    if (actor.type !== "character") return;
-
-    refreshOpenPartySheets(actor);
-});
-
-
-Hooks.on("updateActor", (actor, changed) => {
-    if (actor.type !== "character") return;
-
-    if (Object.hasOwn(changed, "folder")) {
-        refreshAllOpenCharacterSheets();
-        return;
-    }
-
-    refreshOpenPartySheets(actor);
-});
-
-
-Hooks.on("deleteActor", actor => {
-    if (actor.type !== "character") return;
-
-    refreshOpenPartySheets(actor);
-});
-
-
-// ============================================================
-// REST HOOKS
-// ============================================================
-
-Hooks.on("dnd5e.shortRest", actor => {
-    consumeInspiration(actor);
-});
-
-Hooks.on("dnd5e.longRest", actor => {
-    consumeInspiration(actor);
-});
-
-
-// ============================================================
-// UI — TRACK BAR
-// ============================================================
-
-function buildTrackBar(sheetActor) {
-
-    const inspired = isInspired(sheetActor);
-
-    const trackBar = document.createElement("div");
-
-    trackBar.classList.add("track-bar");
-
-    trackBar.innerHTML = `
-        <button
-            type="button"
-            class="bardic-inspiration${inspired ? "" : " hidden"}"
-            data-tooltip="Bardic Inspiration available. It will be offered on your next eligible roll."
-        >
-            <i class="fas fa-music"></i>
-        </button>
-    `;
-
-
-    // --------------------------------------------------------
-    // The button is now an indicator rather than a roll button.
-    // Inspiration is automatically offered during eligible rolls.
-    // --------------------------------------------------------
-
-    trackBar
-        .querySelector(".bardic-inspiration")
-        ?.addEventListener("click", event => {
-
-            event.preventDefault();
-            event.stopPropagation();
-
-            ui.notifications.info(
-                "Bardic Inspiration will be offered automatically when you make an eligible roll."
-            );
-        });
-
-
-    return trackBar;
-}
-
-
-// ============================================================
-// UI — PARTY PANEL
-// ============================================================
-
-function buildPartyPanel(sheetActor) {
-
-    const partyPanel = document.createElement("div");
-
-    partyPanel.classList.add("party-panel");
-
-
-    const partyMembers = getPartyMembers(sheetActor);
-
-    if (!partyMembers.length) {
-        return partyPanel;
-    }
-
-
-    const listItems = partyMembers
-        .map(member => {
-
-            const inspired = isInspired(member);
-
-            return `
-                <li
-                    data-actor-id="${member.id}"
-                    data-key="${member.name}"
-                    title="${
-                        inspired
-                            ? "Already inspired"
-                            : "Click to inspire"
-                    }"
-                >
-                    <i class="fas fa-fw${
-                        inspired
-                            ? " fa-music"
-                            : ""
-                    }"></i>
-
-                    <a class="skill-name">
-                        ${member.name}
-                    </a>
-                </li>
-            `;
-        })
-        .join("");
-
-
-    partyPanel.innerHTML = `
-        <filigree-box class="skills">
-
-            <h3>
-                <i
-                    class="fas fa-fw fa-music"
-                    inert
-                ></i>
-
-                <span class="roboto-upper">
-                    Party
-                </span>
-            </h3>
-
-            <ul>
-                ${listItems}
-            </ul>
-
-        </filigree-box>
-    `;
-
-
-    // --------------------------------------------------------
-    // PARTY MEMBER CLICK
-    // --------------------------------------------------------
-
-    partyPanel.addEventListener("click", async event => {
-
-        const li = event.target.closest(
-            "li[data-actor-id]"
-        );
-
-        if (!li) return;
-
-        event.preventDefault();
-        event.stopPropagation();
-
-
-        const targetActor =
-            game.actors.get(
-                li.dataset.actorId
-            );
-
-        if (!targetActor) return;
-
-
-        // Give Inspiration ONLY.
-        //
-        // IMPORTANT:
-        // This no longer rolls the Inspiration die.
-        //
-
-        await grantBardicInspiration(
-            sheetActor,
-            targetActor
-        );
-
-
-        refreshOpenPartySheets(sheetActor);
-    });
-
-
-    return partyPanel;
-}
-
-
-// ============================================================
-// INSPIRATION STATE
-// ============================================================
-
-function isInspired(actor) {
-
-    return actor.getFlag(
-        MODULE_ID,
-        "inspired"
-    ) === true;
-}
-
 
 // ------------------------------------------------------------
-// Give Inspiration
+// SOCKETLIB
 // ------------------------------------------------------------
 
-async function giveInspiration(
-    actor,
-    sourceActor,
-    bardicDieFormula
-) {
-
-    await actor.setFlag(
-        MODULE_ID,
-        "inspired",
-        true
-    );
-
-    await actor.setFlag(
-        MODULE_ID,
-        "sourceActorId",
-        sourceActor.id
-    );
-
-    await actor.setFlag(
-        MODULE_ID,
-        "sourceActorName",
-        sourceActor.name
-    );
-
-    await actor.setFlag(
-        MODULE_ID,
-        "inspirationDie",
-        bardicDieFormula
-    );
-}
-
-
-// ------------------------------------------------------------
-// Consume Inspiration
-// ------------------------------------------------------------
-
-async function consumeInspiration(actor) {
-
-    await actor.setFlag(
-        MODULE_ID,
-        "inspired",
-        false
-    );
-
-    await actor.unsetFlag(
-        MODULE_ID,
-        "sourceActorId"
-    );
-
-    await actor.unsetFlag(
-        MODULE_ID,
-        "sourceActorName"
-    );
-
-    await actor.unsetFlag(
-        MODULE_ID,
-        "inspirationDie"
-    );
-}
-
-
-// ============================================================
-// BARDIC INSPIRATION
-// ============================================================
-
-async function grantBardicInspiration(
-    bardActor,
-    targetActor
-) {
-
-    // --------------------------------------------------------
-    // Already Inspired?
-    // --------------------------------------------------------
-
-    if (isInspired(targetActor)) {
-
-        ui.notifications.warn(
-            `${targetActor.name} already has Bardic Inspiration.`
-        );
-
+Hooks.once("ready", () => {
+    if (!game.modules.get("socketlib")?.active) {
+        console.warn(`${MODULE_ID} | socketlib is not active.`);
         return;
     }
 
+    const socket = socketlib.registerModule(MODULE_ID);
 
-    // --------------------------------------------------------
-    // Make sure a GM is connected
-    // --------------------------------------------------------
+    socket.register("giveInspiration", async (targetActorId, sourceActorId, sourceActorName, inspirationDie) => {
+        const actor = game.actors.get(targetActorId);
 
-    const gmActive =
-        game.users.some(
-            user =>
-                user.isGM &&
-                user.active
-        );
-
-
-    if (!gmActive) {
-
-        ui.notifications.warn(
-            "A GM must be connected to grant Bardic Inspiration to other players."
-        );
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // Determine the Bard's Inspiration die
-    // --------------------------------------------------------
-
-    const formula =
-        getBardicDie(bardActor);
-
-
-    // --------------------------------------------------------
-    // Consume one Bardic Inspiration charge
-    // --------------------------------------------------------
-
-    const charged =
-        await consumeBardicInspirationCharge(
-            bardActor
-        );
-
-
-    if (!charged) return;
-
-
-    // --------------------------------------------------------
-    // Give Inspiration through GM
-    // --------------------------------------------------------
-
-    try {
-
-        await socket.executeAsGM(
-            "giveInspiration",
-            {
-                targetActorId:
-                    targetActor.id,
-
-                sourceActorId:
-                    bardActor.id,
-
-                formula,
-            }
-        );
-
-    } catch (err) {
-
-        console.error(
-            `${MODULE_ID} | GM execution failed, refunding charge.`,
-            err
-        );
-
-        await refundBardicInspirationCharge(
-            bardActor
-        );
-
-        ui.notifications.error(
-            "Failed to grant Bardic Inspiration — charge refunded."
-        );
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // IMPORTANT:
-    //
-    // DO NOT ROLL HERE.
-    //
-    // The recipient will decide whether to use
-    // Bardic Inspiration when they make a roll.
-    // --------------------------------------------------------
-
-    await ChatMessage.create({
-
-        speaker:
-            ChatMessage.getSpeaker({
-                actor: bardActor
-            }),
-
-        content: `
-
-            <div
-                class="bardic-inspiration-chat"
-                style="
-                    text-align:center;
-                    padding:0.25rem 0;
-                "
-            >
-
-                <div
-                    style="
-                        font-size:1.1rem;
-                        font-weight:bold;
-                        margin-bottom:0.35rem;
-                    "
-                >
-
-                    <i class="fas fa-music"></i>
-
-                    <span style="margin:0 0.4rem;">
-                        Bardic Inspiration
-                    </span>
-
-                    <i class="fas fa-music"></i>
-
-                </div>
-
-
-                <div style="margin-bottom:0.25rem;">
-
-                    <strong>
-                        ${bardActor.name}
-                    </strong>
-
-                    inspires
-
-                    <strong>
-                        ${targetActor.name}
-                    </strong>
-
-                </div>
-
-
-                <div style="font-style:italic;">
-
-                    Inspiration Die:
-
-                    <strong>
-                        ${formula}
-                    </strong>
-
-                </div>
-
-            </div>
-        `,
-    });
-}
-
-
-// ============================================================
-// PRE-ROLL INSPIRATION PROMPT
-// ============================================================
-
-function handleBardicPreRoll(
-    config,
-    dialog,
-    message
-) {
-
-    if (!config) return;
-
-
-    // Don't intercept our own rerolled roll.
-    if (config._bardicInspirationHandled) {
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // Find the actor making the roll
-    // --------------------------------------------------------
-
-    const actor = config.actor;
-
-    if (!actor) return;
-
-
-    // --------------------------------------------------------
-    // Does this character have Inspiration?
-    // --------------------------------------------------------
-
-    if (!isInspired(actor)) {
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // Get the stored Inspiration die
-    // --------------------------------------------------------
-
-    const formula =
-        getInspirationDie(actor);
-
-    if (!formula) return;
-
-
-    // --------------------------------------------------------
-    // Stop the original roll.
-    //
-    // We'll ask the player first.
-    // --------------------------------------------------------
-
-    promptForBardicInspiration(
-        actor,
-        config,
-        dialog,
-        message,
-        formula
-    );
-
-
-    return false;
-}
-
-
-// ============================================================
-// BARDIC INSPIRATION PROMPT
-// ============================================================
-
-async function promptForBardicInspiration(
-    actor,
-    config,
-    dialog,
-    message,
-    formula
-) {
-
-    try {
-
-        let useInspiration = false;
-
-
-        // ----------------------------------------------------
-        // Foundry V13 DialogV2
-        // ----------------------------------------------------
-
-        const DialogClass =
-            foundry.applications?.api?.DialogV2;
-
-
-        if (DialogClass?.confirm) {
-
-            useInspiration =
-                await DialogClass.confirm({
-
-                    window: {
-                        title:
-                            "Bardic Inspiration"
-                    },
-
-
-                    content: `
-
-                        <p>
-                            <strong>
-                                ${actor.name}
-                            </strong>
-                            has Bardic Inspiration available.
-                        </p>
-
-                        <p>
-                            Would you like to add
-                            <strong>
-                                ${formula}
-                            </strong>
-                            to this roll?
-                        </p>
-
-                    `,
-
-
-                    rejectClose: false,
-
-                    modal: true,
-                });
-
-        }
-
-
-        // ----------------------------------------------------
-        // Fallback for older Dialog API
-        // ----------------------------------------------------
-
-        else if (Dialog?.confirm) {
-
-            useInspiration =
-                await Dialog.confirm({
-
-                    title:
-                        "Bardic Inspiration",
-
-                    content: `
-
-                        <p>
-                            <strong>
-                                ${actor.name}
-                            </strong>
-                            has Bardic Inspiration available.
-                        </p>
-
-                        <p>
-                            Would you like to add
-                            <strong>
-                                ${formula}
-                            </strong>
-                            to this roll?
-                        </p>
-
-                    `,
-
-                    defaultYes: false,
-                });
-        }
-
-
-        // ----------------------------------------------------
-        // NO
-        // ----------------------------------------------------
-
-        if (!useInspiration) {
-
-            await rerollWithoutBardicInspiration(
-                actor,
-                config,
-                dialog,
-                message
-            );
-
+        if (!actor) {
+            console.warn(`${MODULE_ID} | Target actor not found:`, targetActorId);
             return;
         }
 
+        await actor.setFlag(MODULE_ID, "inspired", true);
+        await actor.setFlag(MODULE_ID, "sourceActorId", sourceActorId);
+        await actor.setFlag(MODULE_ID, "sourceActorName", sourceActorName);
+        await actor.setFlag(MODULE_ID, "inspirationDie", inspirationDie);
 
-        // ----------------------------------------------------
-        // YES
-        // ----------------------------------------------------
+        ui.notifications.info(`${actor.name} gained Bardic Inspiration (${inspirationDie}).`);
 
-        await rerollWithBardicInspiration(
-            actor,
-            config,
-            dialog,
-            message,
-            formula
-        );
-
-
-    } catch (err) {
-
-        console.error(
-            `${MODULE_ID} | Bardic Inspiration prompt failed`,
-            err
-        );
-
-        ui.notifications.error(
-            "Bardic Inspiration prompt failed; the original roll was not made."
-        );
-    }
-}
-
-
-// ============================================================
-// NORMAL ROLL — NO INSPIRATION
-// ============================================================
-
-async function rerollWithoutBardicInspiration(
-    actor,
-    config,
-    dialog,
-    message
-) {
-
-    const rerollConfig =
-        foundry.utils.deepClone(config);
-
-
-    // Prevent this roll from being intercepted again.
-    rerollConfig._bardicInspirationHandled =
-        true;
-
-
-    const rerollDialog =
-        foundry.utils.deepClone(
-            dialog ?? {}
-        );
-
-
-    // Don't show the roll configuration
-    // dialog a second time.
-    rerollDialog.configure = false;
-
-
-    const rerollMessage =
-        foundry.utils.deepClone(
-            message ?? {}
-        );
-
-
-    await CONFIG.Dice.D20Roll.build(
-        rerollConfig,
-        rerollDialog,
-        rerollMessage
-    );
-}
-
-
-// ============================================================
-// ROLL WITH BARDIC INSPIRATION
-// ============================================================
-
-async function rerollWithBardicInspiration(
-    actor,
-    config,
-    dialog,
-    message,
-    formula
-) {
-
-    const rerollConfig =
-        foundry.utils.deepClone(config);
-
-
-    // Prevent our replacement roll from
-    // triggering the Inspiration prompt again.
-    rerollConfig._bardicInspirationHandled =
-        true;
-
-
-    // --------------------------------------------------------
-    // Add Inspiration to every roll configuration.
-    //
-    // This preserves the normal D&D 5e roll:
-    //
-    // d20
-    // + ability modifier
-    // + proficiency
-    // + expertise
-    // + other modifiers
-    //
-    // and simply adds:
-    //
-    // + 1d8
-    // --------------------------------------------------------
-
-    if (
-        !Array.isArray(
-            rerollConfig.rolls
-        ) ||
-        !rerollConfig.rolls.length
-    ) {
-
-        console.error(
-            `${MODULE_ID} | Could not find pending roll configuration.`,
-            rerollConfig
-        );
-
-        ui.notifications.error(
-            "Could not add Bardic Inspiration to this roll."
-        );
-
-        return;
-    }
-
-
-    for (
-        const rollConfig
-        of rerollConfig.rolls
-    ) {
-
-        rollConfig.parts ??= [];
-
-        rollConfig.parts.push(
-            formula
-        );
-    }
-
-
-    const rerollDialog =
-        foundry.utils.deepClone(
-            dialog ?? {}
-        );
-
-
-    rerollDialog.configure = false;
-
-
-    const rerollMessage =
-        foundry.utils.deepClone(
-            message ?? {}
-        );
-
-
-    // --------------------------------------------------------
-    // Make the modified D&D 5e roll.
-    // --------------------------------------------------------
-
-    await CONFIG.Dice.D20Roll.build(
-        rerollConfig,
-        rerollDialog,
-        rerollMessage
-    );
-
-
-    // --------------------------------------------------------
-    // Consume Inspiration AFTER the player chose YES.
-    // --------------------------------------------------------
-
-    await consumeInspiration(
-        actor
-    );
-
-
-    refreshOpenPartySheets(
-        actor
-    );
-}
-
-
-// ============================================================
-// BARDIC INSPIRATION DIE
-// ============================================================
-
-function getBardicDie(actor) {
-
-    const die =
-        actor
-            .getRollData?.()
-            ?.scale
-            ?.bard
-            ?.inspiration;
-
-
-    if (!die) {
-
-        console.warn(
-            `${MODULE_ID} | Could not find Bardic Inspiration die for ${actor.name}. Defaulting to d6.`
-        );
-
-        ui.notifications.warn(
-            `Could not determine Bardic Inspiration die for ${actor.name}. Using d6.`
-        );
-
-        return "1d6";
-    }
-
-
-    return `1${die}`;
-}
-
-
-// ------------------------------------------------------------
-// Get stored Inspiration die
-// ------------------------------------------------------------
-
-function getInspirationDie(actor) {
-
-    return actor.getFlag(
-        MODULE_ID,
-        "inspirationDie"
-    ) ?? "1d6";
-}
-
-
-// ============================================================
-// BARDIC INSPIRATION CHARGE
-// ============================================================
-
-async function consumeBardicInspirationCharge(
-    bardActor
-) {
-
-    const feature =
-        bardActor.items.find(
-            item =>
-                item.type === "feat" &&
-                item.name
-                    .toLowerCase() ===
-                    "bardic inspiration"
-        );
-
-
-    if (!feature) {
-
-        console.warn(
-            `${MODULE_ID} | Bardic Inspiration feat not found on ${bardActor.name}.`
-        );
-
-        ui.notifications.warn(
-            `Could not find the Bardic Inspiration feature on ${bardActor.name}.`
-        );
-
-        return false;
-    }
-
-
-    const uses =
-        feature.system?.uses;
-
-
-    if (
-        !uses ||
-        uses.max === 0
-    ) {
-
-        // Feature doesn't have
-        // use tracking.
-        return true;
-    }
-
-
-    if (
-        uses.value <= 0
-    ) {
-
-        ui.notifications.warn(
-            `${bardActor.name} has no Bardic Inspiration charges remaining.`
-        );
-
-        return false;
-    }
-
-
-    await feature.update({
-        "system.uses.spent":
-            uses.spent + 1
+        renderOpenSheets(actor);
     });
 
+    game.bardicInspirationTracker = {
+        socket
+    };
+});
+
+// ------------------------------------------------------------
+// ACTOR HELPERS
+// ------------------------------------------------------------
+
+function isInspired(actor) {
+    return actor?.getFlag(MODULE_ID, "inspired") === true;
+}
+
+function getInspirationDie(actor) {
+    return actor?.getFlag(MODULE_ID, "inspirationDie") ?? "1d6";
+}
+
+function getSourceActorName(actor) {
+    return actor?.getFlag(MODULE_ID, "sourceActorName") ?? "a Bard";
+}
+
+async function consumeInspiration(actor) {
+    if (!actor || !isInspired(actor)) return;
+
+    await actor.unsetFlag(MODULE_ID, "inspired");
+    await actor.unsetFlag(MODULE_ID, "sourceActorId");
+    await actor.unsetFlag(MODULE_ID, "sourceActorName");
+    await actor.unsetFlag(MODULE_ID, "inspirationDie");
+
+    renderOpenSheets(actor);
+}
+
+// ------------------------------------------------------------
+// BARDIC INSPIRATION DIE
+// ------------------------------------------------------------
+
+function getBardicDie(actor) {
+    try {
+        const die = actor?.getRollData?.()?.scale?.bard?.inspiration;
+
+        if (die) return die;
+    } catch (err) {
+        console.warn(`${MODULE_ID} | Could not determine Bardic Inspiration die.`, err);
+    }
+
+    console.warn(`${MODULE_ID} | Falling back to 1d6 Bardic Inspiration.`);
+    return "1d6";
+}
+
+// ------------------------------------------------------------
+// FIND BARDIC INSPIRATION FEATURE
+// ------------------------------------------------------------
+
+function getBardicInspirationItem(actor) {
+    return actor?.items?.find(item =>
+        item.name?.toLowerCase() === "bardic inspiration"
+    );
+}
+
+async function consumeBardicInspirationCharge(actor) {
+    const item = getBardicInspirationItem(actor);
+
+    if (!item) {
+        ui.notifications.warn(`${actor.name} does not have a Bardic Inspiration feature.`);
+        return false;
+    }
+
+    const uses = item.system?.uses;
+
+    if (!uses) {
+        ui.notifications.warn("Bardic Inspiration does not have a usable charge tracker.");
+        return false;
+    }
+
+    const max = Number(uses.max ?? 0);
+    const spent = Number(uses.spent ?? 0);
+
+    if (max > 0 && spent >= max) {
+        ui.notifications.warn(`${actor.name} has no Bardic Inspiration uses remaining.`);
+        return false;
+    }
+
+    await item.update({
+        "system.uses.spent": spent + 1
+    });
 
     return true;
 }
 
+// ------------------------------------------------------------
+// PARTY DETECTION
+// ------------------------------------------------------------
 
-// ============================================================
-// REFUND CHARGE
-// ============================================================
+function getPartyMembers(actor) {
+    const method = game.settings.get(MODULE_ID, "partyMethod");
 
-async function refundBardicInspirationCharge(
-    bardActor
-) {
+    if (method === "scene") {
+        const members = [];
 
-    const feature =
-        bardActor.items.find(
-            item =>
-                item.type === "feat" &&
-                item.name
-                    .toLowerCase() ===
-                    "bardic inspiration"
+        for (const token of canvas.tokens?.placeables ?? []) {
+            const tokenActor = token.actor;
+
+            if (!tokenActor) continue;
+            if (tokenActor.id === actor.id) continue;
+            if (tokenActor.type !== "character") continue;
+
+            if (!members.some(a => a.id === tokenActor.id)) {
+                members.push(tokenActor);
+            }
+        }
+
+        return members;
+    }
+
+    const folder = actor.folder;
+
+    if (!folder) return [];
+
+    return game.actors.filter(otherActor =>
+        otherActor.id !== actor.id &&
+        otherActor.folder?.id === folder.id &&
+        otherActor.type === "character"
+    );
+}
+
+// ------------------------------------------------------------
+// RENDER SHEET
+// ------------------------------------------------------------
+
+Hooks.on("renderActorSheetV2", (app, html) => {
+    const actor = app.actor;
+
+    if (!actor) return;
+
+    buildTracker(app, html, actor);
+    buildPartyPanel(app, html, actor);
+});
+
+// ------------------------------------------------------------
+// TRACKER
+// ------------------------------------------------------------
+
+function buildTracker(app, html, actor) {
+    const root = html instanceof HTMLElement
+        ? html
+        : html?.[0];
+
+    if (!root) return;
+
+    root.querySelector(".bardic-inspiration-tracker")?.remove();
+
+    if (!isInspired(actor)) return;
+
+    const tracker = document.createElement("div");
+    tracker.classList.add("bardic-inspiration-tracker");
+
+    tracker.innerHTML = `
+        <button
+            type="button"
+            class="bardic-inspiration"
+            title="Bardic Inspiration available"
+        >
+            <i class="fas fa-music"></i>
+            <span>Bardic Inspiration</span>
+        </button>
+    `;
+
+    tracker.querySelector(".bardic-inspiration")?.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        ui.notifications.info(
+            "Bardic Inspiration will be offered automatically when you make an eligible roll."
         );
+    });
 
+    const header = root.querySelector("header");
+    const tabs = root.querySelector(".sheet-tabs");
 
-    if (!feature) return;
+    if (header) {
+        header.appendChild(tracker);
+    } else if (tabs) {
+        tabs.parentElement?.insertBefore(tracker, tabs);
+    } else {
+        root.prepend(tracker);
+    }
+}
 
+// ------------------------------------------------------------
+// PARTY PANEL
+// ------------------------------------------------------------
 
-    const uses =
-        feature.system?.uses;
+function buildPartyPanel(app, html, actor) {
+    if (actor.type !== "character") return;
 
+    const isBard = actor.items?.some(item =>
+        item.name?.toLowerCase() === "bard"
+    ) || actor.system?.details?.class?.toLowerCase?.() === "bard";
 
-    if (
-        !uses ||
-        uses.max === 0
-    ) {
+    if (!isBard) return;
+
+    const root = html instanceof HTMLElement
+        ? html
+        : html?.[0];
+
+    if (!root) return;
+
+    root.querySelector(".bardic-inspiration-party")?.remove();
+
+    const members = getPartyMembers(actor);
+
+    if (!members.length) return;
+
+    const panel = document.createElement("div");
+    panel.classList.add("bardic-inspiration-party");
+
+    panel.innerHTML = `
+        <div class="bardic-inspiration-party-title">
+            <i class="fas fa-music"></i>
+            Bardic Inspiration
+        </div>
+        <div class="bardic-inspiration-party-list"></div>
+    `;
+
+    const list = panel.querySelector(".bardic-inspiration-party-list");
+
+    for (const member of members) {
+        const inspired = isInspired(member);
+
+        const button = document.createElement("button");
+        button.type = "button";
+        button.classList.add("bardic-party-member");
+
+        if (inspired) {
+            button.disabled = true;
+            button.classList.add("inspired");
+        }
+
+        button.innerHTML = `
+            <img src="${member.img}" />
+            <span>${member.name}</span>
+            ${inspired ? `<i class="fas fa-check"></i>` : ""}
+        `;
+
+        if (!inspired) {
+            button.addEventListener("click", async event => {
+                event.preventDefault();
+                event.stopPropagation();
+
+                await grantBardicInspiration(actor, member);
+            });
+        }
+
+        list.appendChild(button);
+    }
+
+    const detailsTab =
+        root.querySelector('[data-tab="details"]') ||
+        root.querySelector(".tab.details");
+
+    if (detailsTab) {
+        detailsTab.appendChild(panel);
+    } else {
+        root.appendChild(panel);
+    }
+}
+
+// ------------------------------------------------------------
+// GRANT BARDIC INSPIRATION
+// ------------------------------------------------------------
+
+async function grantBardicInspiration(sourceActor, targetActor) {
+    if (!sourceActor || !targetActor) return;
+
+    if (isInspired(targetActor)) {
+        ui.notifications.warn(`${targetActor.name} already has Bardic Inspiration.`);
         return;
     }
 
+    if (!game.user.isGM && !game.users.find(u => u.isGM && u.active)) {
+        ui.notifications.error("No active GM is available.");
+        return;
+    }
 
-    await feature.update({
+    const inspirationDie = getBardicDie(sourceActor);
 
-        "system.uses.spent":
-            Math.max(
-                0,
-                uses.spent - 1
-            )
+    const consumed = await consumeBardicInspirationCharge(sourceActor);
+
+    if (!consumed) return;
+
+    const socket = game.bardicInspirationTracker?.socket;
+
+    if (!socket) {
+        ui.notifications.error("Bardic Inspiration socket is not available.");
+        return;
+    }
+
+    try {
+        await socket.executeAsGM(
+            "giveInspiration",
+            targetActor.id,
+            sourceActor.id,
+            sourceActor.name,
+            inspirationDie
+        );
+
+        ChatMessage.create({
+            speaker: ChatMessage.getSpeaker({ actor: sourceActor }),
+            content: `
+                <p><strong>${sourceActor.name}</strong> inspires
+                <strong>${targetActor.name}</strong> with Bardic Inspiration!</p>
+                <p>Inspiration die: <strong>${inspirationDie}</strong></p>
+            `
+        });
+
+        renderOpenSheets(sourceActor);
+        renderOpenSheets(targetActor);
+
+    } catch (err) {
+        console.error(`${MODULE_ID} | Failed to grant Bardic Inspiration:`, err);
+
+        ui.notifications.error(
+            "Something went wrong while granting Bardic Inspiration."
+        );
+    }
+}
+
+// ------------------------------------------------------------
+// BARDIC INSPIRATION PROMPT
+// ------------------------------------------------------------
+
+async function promptForBardicInspiration(actor, config) {
+    const die = getInspirationDie(actor);
+    const sourceName = getSourceActorName(actor);
+
+    const message =
+        `${sourceName} gave you Bardic Inspiration (${die}). ` +
+        `Would you like to add it to this roll?`;
+
+    // Foundry V13 DialogV2
+    if (foundry?.applications?.api?.DialogV2) {
+        return await foundry.applications.api.DialogV2.confirm({
+            window: {
+                title: "Bardic Inspiration"
+            },
+            content: `
+                <p>${message}</p>
+                <p><strong>Inspiration Die: ${die}</strong></p>
+            `,
+            yes: {
+                label: "Yes"
+            },
+            no: {
+                label: "No"
+            }
+        });
+    }
+
+    // Legacy fallback
+    return await new Promise(resolve => {
+        new Dialog({
+            title: "Bardic Inspiration",
+            content: `
+                <p>${message}</p>
+                <p><strong>Inspiration Die: ${die}</strong></p>
+            `,
+            buttons: {
+                yes: {
+                    label: "Yes",
+                    callback: () => resolve(true)
+                },
+                no: {
+                    label: "No",
+                    callback: () => resolve(false)
+                }
+            },
+            default: "no",
+            close: () => resolve(false)
+        }).render(true);
     });
 }
 
+// ------------------------------------------------------------
+// PRE-ROLL HANDLER
+// ------------------------------------------------------------
 
-// ============================================================
-// PARTY DETECTION
-// ============================================================
+async function handleBardicPreRoll(config, dialog, message) {
+    if (!config) return;
 
-function getPartyMembers(actor) {
+    // Prevent our manually-created roll from triggering the prompt again.
+    if (config._bardicInspirationHandled) return;
 
-    const method =
-        game.settings.get(
-            MODULE_ID,
-            "partyMethod"
-        );
+    // D&D 5e 5.3.3 does not place the actor on config.
+    // The current user's character is the actor making the roll.
+    const actor = config.actor ?? game.user.character;
 
+    if (!actor) return;
 
-    // --------------------------------------------------------
-    // ACTIVE SCENE TOKENS
-    // --------------------------------------------------------
+    if (!isInspired(actor)) return;
 
-    if (method === "scene") {
-
-        const scene =
-            game.scenes?.active;
-
-
-        if (!scene) return [];
-
-
-        return scene.tokens
-
-            .filter(
-                token =>
-                    token.actor &&
-                    token.actor.type ===
-                        "character" &&
-                    token.actor.id !==
-                        actor.id
-            )
-
-            .map(
-                token =>
-                    token.actor
-            );
-    }
-
-
-    // --------------------------------------------------------
-    // SAME FOLDER
-    // --------------------------------------------------------
-
-    const folder =
-        actor.folder;
-
-
-    if (!folder) {
-        return [];
-    }
-
-
-    return folder.contents.filter(
-        character =>
-            character.type ===
-                "character" &&
-            character.id !==
-                actor.id
-    );
-}
-
-
-// ============================================================
-// SHEET REFRESH
-// ============================================================
-
-function refreshOpenPartySheets(
-    changedActor
-) {
+    const inspirationDie = getInspirationDie(actor);
 
     console.log(
-        `${MODULE_ID} | Refreshing party sheets for: ${changedActor.name}`
+        `${MODULE_ID} | Bardic Inspiration available for ${actor.name}`,
+        {
+            config,
+            inspirationDie
+        }
     );
 
+    // Cancel the normal roll while we ask the player.
+    const choicePromise = promptForBardicInspiration(actor, config);
 
-    const method =
-        game.settings.get(
-            MODULE_ID,
-            "partyMethod"
-        );
+    // The hook itself cannot await our prompt, so cancel the original
+    // roll immediately and perform it manually after the choice.
+    choicePromise.then(async useInspiration => {
 
+        const rerollConfig = foundry.utils.deepClone(config);
 
-    let partyMembers;
+        rerollConfig._bardicInspirationHandled = true;
 
+        // Do not open the normal Advantage/Normal/Disadvantage dialog again.
+        rerollConfig.configure = false;
 
-    if (method === "scene") {
+        // If the player says NO, reproduce the original roll.
+        if (!useInspiration) {
+            try {
+                await CONFIG.Dice.D20Roll.build(
+                    rerollConfig,
+                    {
+                        configure: false
+                    },
+                    message
+                );
+            } catch (err) {
+                console.error(
+                    `${MODULE_ID} | Failed to perform normal roll after declining Inspiration:`,
+                    err
+                );
+            }
 
-        partyMembers = [
-            changedActor,
-            ...getPartyMembers(
-                changedActor
-            )
-        ];
+            return;
+        }
 
-    } else {
+        // Player said YES.
+        //
+        // Add the Inspiration die to every roll configuration contained
+        // in the D&D 5e roll config.
+        if (Array.isArray(rerollConfig.rolls)) {
+            for (const rollConfig of rerollConfig.rolls) {
+                if (!Array.isArray(rollConfig.parts)) {
+                    rollConfig.parts = [];
+                }
 
-        const folderId =
-            changedActor
-                ?.folder
-                ?.id;
+                rollConfig.parts.push(inspirationDie);
+            }
+        } else {
+            // Fallback if the roll config does not contain a rolls array.
+            if (!Array.isArray(rerollConfig.parts)) {
+                rerollConfig.parts = [];
+            }
 
+            rerollConfig.parts.push(inspirationDie);
+        }
 
-        if (!folderId) return;
-
-
-        partyMembers =
-            game.actors.filter(
-                actor =>
-                    actor.type ===
-                        "character" &&
-                    actor.folder?.id ===
-                        folderId
+        try {
+            await CONFIG.Dice.D20Roll.build(
+                rerollConfig,
+                {
+                    configure: false
+                },
+                message
             );
+
+            // Inspiration is consumed only after the enhanced roll
+            // has successfully been created.
+            await consumeInspiration(actor);
+
+            ChatMessage.create({
+                speaker: ChatMessage.getSpeaker({ actor }),
+                content: `
+                    <p><strong>${actor.name}</strong> used Bardic Inspiration!</p>
+                    <p>Added <strong>${inspirationDie}</strong> to the roll.</p>
+                `
+            });
+
+        } catch (err) {
+            console.error(
+                `${MODULE_ID} | Failed to perform Bardic Inspiration roll:`,
+                err
+            );
+
+            ui.notifications.error(
+                "The Bardic Inspiration roll could not be completed. Your Inspiration was not consumed."
+            );
+        }
+    });
+
+    // IMPORTANT:
+    // The original D&D 5e roll must be stopped while our asynchronous
+    // prompt is displayed.
+    return false;
+}
+
+// ------------------------------------------------------------
+// SKILL CHECKS
+// ------------------------------------------------------------
+
+Hooks.on("dnd5e.preRollSkill", (config, dialog, message) => {
+    return handleBardicPreRoll(config, dialog, message);
+});
+
+// ------------------------------------------------------------
+// ABILITY CHECKS
+// ------------------------------------------------------------
+
+Hooks.on("dnd5e.preRollAbilityCheck", (config, dialog, message) => {
+    return handleBardicPreRoll(config, dialog, message);
+});
+
+// Some versions use AbilityTest terminology.
+// This is harmless if the hook is not fired.
+Hooks.on("dnd5e.preRollAbilityTest", (config, dialog, message) => {
+    return handleBardicPreRoll(config, dialog, message);
+});
+
+// ------------------------------------------------------------
+// SAVING THROWS
+// ------------------------------------------------------------
+
+Hooks.on("dnd5e.preRollSavingThrow", (config, dialog, message) => {
+    return handleBardicPreRoll(config, dialog, message);
+});
+
+// ------------------------------------------------------------
+// ATTACKS
+// ------------------------------------------------------------
+//
+// D&D 5e V2 attack workflow.
+
+Hooks.on("dnd5e.preRollAttackV2", (config, dialog, message) => {
+    return handleBardicPreRoll(config, dialog, message);
+});
+
+// ------------------------------------------------------------
+// REFRESH SHEETS
+// ------------------------------------------------------------
+
+function renderOpenSheets(actor) {
+    if (!actor) return;
+
+    for (const app of actor.apps ? Object.values(actor.apps) : []) {
+        try {
+            app.render();
+        } catch (err) {
+            console.warn(`${MODULE_ID} | Could not render sheet.`, err);
+        }
     }
 
-
-    for (
-        const actor
-        of partyMembers
-    ) {
-
-        for (
-            const app
-            of Object.values(
-                actor.apps ?? {}
-            )
-        ) {
-
-            app.render(false);
+    // Foundry V13 application collection fallback
+    for (const app of Object.values(ui.windows ?? {})) {
+        if (app?.actor?.id === actor.id) {
+            try {
+                app.render();
+            } catch (err) {
+                console.warn(`${MODULE_ID} | Could not render application.`, err);
+            }
         }
     }
 }
 
+// ------------------------------------------------------------
+// ACTOR LIFECYCLE
+// ------------------------------------------------------------
 
-// ============================================================
-// REFRESH ALL CHARACTER SHEETS
-// ============================================================
+Hooks.on("createActor", actor => {
+    renderOpenSheets(actor);
+});
 
-function refreshAllOpenCharacterSheets() {
+Hooks.on("updateActor", actor => {
+    renderOpenSheets(actor);
+});
 
-    for (
-        const actor
-        of game.actors.filter(
-            actor =>
-                actor.type ===
-                "character"
-        )
-    ) {
+Hooks.on("deleteActor", actor => {
+    renderOpenSheets(actor);
+});
 
-        for (
-            const app
-            of Object.values(
-                actor.apps ?? {}
-            )
-        ) {
+// ------------------------------------------------------------
+// RESTS
+// ------------------------------------------------------------
 
-            app.render(false);
-        }
-    }
-}
+Hooks.on("dnd5e.shortRest", async actor => {
+    await consumeInspiration(actor);
+});
 
+Hooks.on("dnd5e.longRest", async actor => {
+    await consumeInspiration(actor);
+});
 
-// ============================================================
-// SOCKET — GM SIDE
-// ============================================================
+// ------------------------------------------------------------
+// DEBUG
+// ------------------------------------------------------------
 
-async function handleGiveInspiration({
-    targetActorId,
-    sourceActorId,
-    formula
-}) {
-
-    const targetActor =
-        game.actors.get(
-            targetActorId
-        );
-
-
-    const sourceActor =
-        game.actors.get(
-            sourceActorId
-        );
-
-
-    if (
-        !targetActor ||
-        !sourceActor
-    ) {
-        return;
-    }
-
-
-    await giveInspiration(
-        targetActor,
-        sourceActor,
-        formula
-    );
-
-
-    refreshOpenPartySheets(
-        targetActor
-    );
-}
+console.log(`${MODULE_ID} | Loaded.`);
